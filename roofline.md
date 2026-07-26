@@ -91,6 +91,32 @@ T_\text{math} = \frac{\text{Computation FLOPs}}{\text{Accelerator FLOPs/s}}
 
 For instance, an NVIDIA H100 can perform about 9.89e14 bfloat16<d-footnote>bf16 is short for <a href="https://en.wikipedia.org/wiki/Bfloat16_floating-point_format">bfloat16</a>, a 16-bit floating point format often used in ML.</d-footnote> FLOPs/s while a TPU v6e can perform 9.1e14 FLOPs/s.<d-footnote>H100s and B200s can usually only achieve around 80-85% of the claimed peak FLOPs, while TPUs can get closer to 95% in normal use.</d-footnote> That means doing 1e12 FLOPs on an H100 will take (roughly) `1e12 / 9.89e14 = 1.01ms` and `1e12 / 9.1e14 = 1.1ms` on a TPU v6e.<d-footnote>Note that these chips are priced differently, and this comparison does not normalize to cost.</d-footnote>
 
+{% details Notes %}
+BF16 (bfloat16), which stands for Brain Floating Point 16-bit, is a floating-point format developed by Google Brain. It has become the industry standard for training and running large deep learning models such as LLMs.
+
+Here is a comparison among FP32, FP16, and BF16:
+
+* FP32 (32-bit):  [S] [  EEEEEEEE (8-bit)  ] [  FFFFFFFFFFFFFFFFFFFFFFF (23-bit)  ]
+* BF16 (16-bit):  [S] [  EEEEEEEE (8-bit)  ] [  FFFFFFF (7-bit) ]
+* FP16 (16-bit):  [S] [    EEEEE (5-bit)   ] [  FFFFFFFFFF (10-bit)  ]
+
+
+Where:  
+* S = Sign bit (1 bit)
+* E = Exponent bits (determines dynamic range / how large or small the number can be)
+* F = Fraction / Mantissa bits (determines precision / how detailed the number is)
+
+Why BF16 is preferred over FP16:
+
+* **Dynamic Range**: BF16 has 8 exponent bits, exactly the same as FP32. This means it can represent numbers as large as $10^{38}$ and as small as $10^{-38}$. FP16 only has 5 exponent bits, capping its range at $10^{-5}$ to $10^{5}$, which is more likely to cause overflow and underflow issues during training.
+
+* **Easy Conversion**: Converting from FP32 to BF16 is mathematically trivial. You simply copy the first 16 bits of the FP32 representation (optionally rounding the mantissa).
+
+As explored later, adopting lower-precision formats like BF16 is critical to overcoming the memory bandwidth bottleneck during training. However, mixed-precision training can introduce significant training instabilities. For instance, paper [*Why Low-Precision Transformer Training Fails: An Analysis on Flash Attention*](https://arxiv.org/abs/2510.04212) analyzes such training stability issues as discussed in [nanoGPT issues 524](https://github.com/karpathy/nanoGPT/issues/524).
+
+{% enddetails %}
+
+
 **Communication within a chip:** *Within an accelerator*, tensors need to be transferred between accelerator memory (HBM) and the compute cores. You'll see the bandwidth of this link referred to as "HBM bandwidth".<d-footnote>NVIDIA also calls this "memory bandwidth."</d-footnote> On an H100, [this is about 3.35TB/s](https://www.nvidia.com/en-us/data-center/h100/) and on TPU v6e [this is about 1.6TB/s](https://cloud.google.com/tpu/docs/v6e).
 
 **Communication between chips:**  When we distribute a model *across* multiple accelerators, tensors frequently need to be transferred between them. There are often a few options for this on our hardware (ICI, DCN, and PCIe), each with different bandwidths.
@@ -112,6 +138,11 @@ T_\text{upper} = T_\text{math} + T_\text{comms}
 \end{equation}$$
 
 If we assume we can perfectly overlap communication and computation, when $T_\text{math} > T_\text{comms}$, we see full utilization from our hardware. We call this being "compute-bound". When $T_\text{comms} > T_\text{math}$, we tend to be "communication-bound"<d-footnote>We'll use "communication-bound", "comms-bound", "memory-bound", and "bandwidth-bound" interchangeably throughout this book.</d-footnote> and at least some fraction of our accelerator FLOPs/s is wasted waiting for data to be passed around. One way to tell if an operation will be compute or communication-bound is to look at its "**arithmetic intensity**" or "**operational intensity**".
+
+{% details Notes %}
+As explored later in this book, improving hardware efficiency is mostly about optimizing communication. For any given training task, the total computation (FLOPs) is fixed and predictable. However, because memory and network bandwidth have not scaled as quickly as raw compute performance in recent years, communication is typically the primary bottleneck. Optimizing communication is crucial to prevent expensive accelerators from sitting idle.
+{% enddetails %}
+
 
 **Definition:** the arithmetic intensity of an algorithm is given by the ratio of the total FLOPs it performs to the number of bytes it needs to communicate — either within a chip or between chips.
 
@@ -141,6 +172,15 @@ as $N\rightarrow\infty$. So the dot product has an arithmetic intensity of $\fra
 We can visualize the tradeoff between memory and compute using a **roofline plot**, which plots the peak achievable FLOPs/s (throughput) of an algorithm on our hardware (the y-axis) against the arithmetic intensity of that algorithm (the x-axis). Here's an example log-log plot:
 
 {% include figure.liquid path="assets/img/roofline-improved.png" class="img-fluid" caption="<b>Figure:</b> an example roofline plot showing two algorithms with different arithmetic intensities (Algo 1 and Algo 2) and their corresponding theoretical peak throughput under different bandwidths (BW1 and BW2). In the red area, an algorithm is bandwidth bound at both bandwidths and is wasting some fraction of the hardware's peak FLOPs/s. The yellow area is bandwidth-bound only at the lower bandwidth (BW1). The green area is compute-bound at all bandwidths. Here, we are using the peak FLOPs/s of the accelerator and increasing bandwidth or improving intensity yield no benefit." %}
+
+{% details Notes %}
+In the above figure:
+* **The X-axis (Arithmetic Intensity)** is measured in FLOPs per Byte. Moving from left to right indicates that the algorithm performs more floating point operations for every byte of data transferred.
+* **The Y-axis (Attainable Performance)** represents the execution throughput of the hardware, measured in FLOPs/second.
+* Because the bandwidth $\text{BW}_2 > \text{BW}_1$, an algorithm in the bandwidth-bound (red) area achieves higher performance with $\text{BW}_2$ than with $\text{BW}_1$, as data can be loaded faster.
+* Since $\text{Performance} = \text{Arithmetic Intensity} \times \text{Bandwidth}$, this relationship forms a straight diagonal line on a log-log plot, where the intercept represents the bandwidth and the slope is always 1 (45-degreee).
+{% enddetails %}
+
 
 Above, as the intensity increases (moving left to right), we initially see a linear increase in the performance of our algorithm (in FLOPs/s) until we hit the critical arithmetic intensity of the hardware, 240 in the case of the TPU v5e. Any algorithm with a lower intensity will be bandwidth (BW) bound and limited by the peak memory bandwidth (shown in red). Any algorithm to the right will fully utilize our FLOPs (shown in green). Here, Algo 1 is comms-bound and uses only a fraction of the total hardware FLOPs/s. Algo 2 is compute-bound. We can generally improve the performance of an algorithm either by increasing its arithmetic intensity or by increasing the memory bandwidth available (moving from BW1 to BW2).
 
